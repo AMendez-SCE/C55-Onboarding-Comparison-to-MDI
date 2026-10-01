@@ -1,0 +1,139 @@
+import pandas as pd
+from openpyxl import Workbook
+
+file = "MDI TPP List Analysis.xlsx"
+
+# Read worksheets
+all_tpp = pd.read_excel(
+    file,
+    sheet_name="All TPP",
+    engine="openpyxl"
+)
+
+c55 = pd.read_excel(
+    file,
+    sheet_name="Matching C55 Projects",
+    engine="openpyxl"
+)
+
+# Clean column names
+all_tpp.columns = [str(c).strip() for c in all_tpp.columns]
+c55.columns = [str(c).strip() for c in c55.columns]
+
+# Key columns
+mdi_key = "Shared Cost Number"
+c55_key = "MDI Legacy Shared Cost #"
+
+# Create normalized comparison keys
+all_tpp["_key"] = all_tpp[mdi_key].astype(str).str.strip()
+c55["_key"] = c55[c55_key].astype(str).str.strip()
+
+# Find common columns
+mdi_cols = [c for c in all_tpp.columns if c != "_key"]
+c55_cols = [c for c in c55.columns if c != "_key"]
+
+common_columns = [c for c in mdi_cols if c in c55_cols]
+
+# Index by key
+mdi_data = all_tpp.set_index("_key", drop=False)
+c55_data = c55.set_index("_key", drop=False)
+
+# Determine record matches
+mdi_only = sorted(set(mdi_data.index) - set(c55_data.index))
+c55_only = sorted(set(c55_data.index) - set(mdi_data.index))
+matching_keys = sorted(set(mdi_data.index) & set(c55_data.index))
+
+# Compare field values
+differences = []
+
+for key in matching_keys:
+
+    mdi_row = mdi_data.loc[key]
+    c55_row = c55_data.loc[key]
+
+    if isinstance(mdi_row, pd.DataFrame):
+        mdi_row = mdi_row.iloc[0]
+
+    if isinstance(c55_row, pd.DataFrame):
+        c55_row = c55_row.iloc[0]
+
+    for column in common_columns:
+
+        mdi_value = mdi_row.get(column)
+        c55_value = c55_row.get(column)
+
+        def normalize(value):
+            if pd.isna(value):
+                return ""
+            return str(value).strip()
+
+        if normalize(mdi_value) != normalize(c55_value):
+            differences.append([
+                key,
+                column,
+                mdi_value,
+                c55_value
+            ])
+
+# Create results dataframe
+changes_df = pd.DataFrame(
+    differences,
+    columns=[
+        "Shared Cost Number",
+        "Field Name",
+        "MDI Value",
+        "C55 Value"
+    ]
+)
+
+# Write report
+output_file = "MDI_TPP_Comparison_Report.xlsx"
+
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+
+    changes_df.to_excel(
+        writer,
+        sheet_name="Field Changes",
+        index=False
+    )
+
+    pd.DataFrame({
+        "Shared Cost Number": mdi_only
+    }).to_excel(
+        writer,
+        sheet_name="MDI Only",
+        index=False
+    )
+
+    pd.DataFrame({
+        "Shared Cost Number": c55_only
+    }).to_excel(
+        writer,
+        sheet_name="C55 Only",
+        index=False
+    )
+
+    pd.DataFrame({
+        "Metric": [
+            "MDI Records",
+            "C55 Records",
+            "Matching Keys",
+            "MDI Only",
+            "C55 Only",
+            "Field Differences"
+        ],
+        "Value": [
+            len(all_tpp),
+            len(c55),
+            len(matching_keys),
+            len(mdi_only),
+            len(c55_only),
+            len(changes_df)
+        ]
+    }).to_excel(
+        writer,
+        sheet_name="Summary",
+        index=False
+    )
+
+print(f"Report written to: {output_file}")
