@@ -1,55 +1,162 @@
 import pandas as pd
-from openpyxl import Workbook
+import numpy as np
+import re
+from difflib import SequenceMatcher
 
-file = "MDI TPP List Analysis.xlsx"
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
 
-# Read worksheets
-all_tpp = pd.read_excel(
-    file,
-    sheet_name="All TPP",
+INPUT_FILE = "MDI TPP List Analysis.xlsx"
+
+MDI_SHEET = "All TPP"
+C55_SHEET = "Matching C55 Projects"
+
+MDI_KEY = "Shared Cost Number"
+C55_KEY = "MDI Legacy Shared Cost #"
+
+FUZZY_MATCH_THRESHOLD = 0.80
+
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+
+def normalize_column_name(col_name):
+    """
+    Normalize column names for matching.
+    """
+
+    if pd.isna(col_name):
+        return ""
+
+    value = str(col_name).strip().lower()
+
+    value = value.replace("&", "and")
+    value = value.replace("#", "number")
+
+    value = re.sub(r"[^a-z0-9]", "", value)
+
+    return value
+
+
+def similarity(a, b):
+    return SequenceMatcher(
+        None,
+        normalize_column_name(a),
+        normalize_column_name(b)
+    ).ratio()
+
+
+def normalize_value(v):
+
+    if pd.isna(v):
+        return ""
+
+    if isinstance(v, pd.Timestamp):
+        return v.strftime("%Y-%m-%d")
+
+    return str(v).strip()
+
+
+# --------------------------------------------------
+# LOAD DATA
+# --------------------------------------------------
+
+mdi = pd.read_excel(
+    INPUT_FILE,
+    sheet_name=MDI_SHEET,
     engine="openpyxl"
 )
 
 c55 = pd.read_excel(
-    file,
-    sheet_name="Matching C55 Projects",
+    INPUT_FILE,
+    sheet_name=C55_SHEET,
     engine="openpyxl"
 )
 
-# Clean column names
-all_tpp.columns = [str(c).strip() for c in all_tpp.columns]
+mdi.columns = [str(c).strip() for c in mdi.columns]
 c55.columns = [str(c).strip() for c in c55.columns]
 
-# Key columns
-mdi_key = "Shared Cost Number"
-c55_key = "MDI Legacy Shared Cost #"
+# --------------------------------------------------
+# BUILD COLUMN MAPPING
+# --------------------------------------------------
 
-# Create normalized comparison keys
-all_tpp["_key"] = all_tpp[mdi_key].astype(str).str.strip()
-c55["_key"] = c55[c55_key].astype(str).str.strip()
+mdi_cols = list(mdi.columns)
+c55_cols = list(c55.columns)
 
-# Find common columns
-mdi_cols = [c for c in all_tpp.columns if c != "_key"]
-c55_cols = [c for c in c55.columns if c != "_key"]
+mapping_rows = []
 
-common_columns = [c for c in mdi_cols if c in c55_cols]
+used_c55_columns = set()
 
-# Index by key
-mdi_data = all_tpp.set_index("_key", drop=False)
-c55_data = c55.set_index("_key", drop=False)
+for mdi_col in mdi_cols:
 
-# Determine record matches
-mdi_only = sorted(set(mdi_data.index) - set(c55_data.index))
-c55_only = sorted(set(c55_data.index) - set(mdi_data.index))
-matching_keys = sorted(set(mdi_data.index) & set(c55_data.index))
+    best_match = None
+    best_score = 0
 
-# Compare field values
-differences = []
+    # Exact match
+    for c55_col in c55_cols:
+
+        if normalize_column_name(mdi_col) == normalize_column_name(c55_col):
+            best_match = c55_col
+            best_score = 1.0
+            break
+
+    # Fuzzy match
+    if best_match is None:
+
+        for c55_col in c55_cols:
+
+            score = similarity(mdi_col, c55_col)
+
+            if score > best_score:
+                best_score = score
+                best_match = c55_col
+
+    matched = best_score >= FUZZY_MATCH_THRESHOLD
+
+    mapping_rows.append({
+        "MDI Column": mdi_col,
+        "C55 Column": best_match if matched else None,
+        "Similarity Score": round(best_score, 3),
+        "Mapped": matched
+    })
+
+    if matched and best_match:
+        used_c55_columns.add(best_match)
+
+mapping_df = pd.DataFrame(mapping_rows)
+
+# --------------------------------------------------
+# PREPARE RECORD MATCHING
+# --------------------------------------------------
+
+mdi["_KEY"] = mdi[MDI_KEY].astype(str).str.strip()
+c55["_KEY"] = c55[C55_KEY].astype(str).str.strip()
+
+mdi_indexed = mdi.set_index("_KEY", drop=False)
+c55_indexed = c55.set_index("_KEY", drop=False)
+
+mdi_keys = set(mdi_indexed.index)
+c55_keys = set(c55_indexed.index)
+
+matching_keys = sorted(mdi_keys & c55_keys)
+mdi_only = sorted(mdi_keys - c55_keys)
+c55_only = sorted(c55_keys - mdi_keys)
+
+# --------------------------------------------------
+# COMPARE DATA
+# --------------------------------------------------
+
+changes = []
+
+mapped_columns = mapping_df[
+    mapping_df["Mapped"] == True
+]
 
 for key in matching_keys:
 
-    mdi_row = mdi_data.loc[key]
-    c55_row = c55_data.loc[key]
+    mdi_row = mdi_indexed.loc[key]
+    c55_row = c55_indexed.loc[key]
 
     if isinstance(mdi_row, pd.DataFrame):
         mdi_row = mdi_row.iloc[0]
@@ -57,83 +164,99 @@ for key in matching_keys:
     if isinstance(c55_row, pd.DataFrame):
         c55_row = c55_row.iloc[0]
 
-    for column in common_columns:
+    for _, map_row in mapped_columns.iterrows():
 
-        mdi_value = mdi_row.get(column)
-        c55_value = c55_row.get(column)
+        mdi_col = map_row["MDI Column"]
+        c55_col = map_row["C55 Column"]
 
-        def normalize(value):
-            if pd.isna(value):
-                return ""
-            return str(value).strip()
+        mdi_value = mdi_row.get(mdi_col)
+        c55_value = c55_row.get(c55_col)
 
-        if normalize(mdi_value) != normalize(c55_value):
-            differences.append([
-                key,
-                column,
-                mdi_value,
-                c55_value
-            ])
+        if normalize_value(mdi_value) != normalize_value(c55_value):
 
-# Create results dataframe
-changes_df = pd.DataFrame(
-    differences,
-    columns=[
-        "Shared Cost Number",
-        "Field Name",
-        "MDI Value",
-        "C55 Value"
+            changes.append({
+                "Shared Cost Number": key,
+                "MDI Column": mdi_col,
+                "C55 Column": c55_col,
+                "MDI Value": mdi_value,
+                "C55 Value": c55_value,
+                "Similarity Score": map_row["Similarity Score"]
+            })
+
+changes_df = pd.DataFrame(changes)
+
+# --------------------------------------------------
+# SUMMARY
+# --------------------------------------------------
+
+summary_df = pd.DataFrame({
+    "Metric": [
+        "MDI Records",
+        "C55 Records",
+        "Matching Records",
+        "MDI Only Records",
+        "C55 Only Records",
+        "Mapped Columns",
+        "Field Differences"
+    ],
+    "Value": [
+        len(mdi),
+        len(c55),
+        len(matching_keys),
+        len(mdi_only),
+        len(c55_only),
+        len(mapped_columns),
+        len(changes_df)
     ]
-)
+})
 
-# Write report
-output_file = "MDI_TPP_Comparison_Report.xlsx"
+mdi_only_df = pd.DataFrame({
+    "Shared Cost Number": mdi_only
+})
 
-with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+c55_only_df = pd.DataFrame({
+    "Shared Cost Number": c55_only
+})
 
-    changes_df.to_excel(
-        writer,
-        sheet_name="Field Changes",
-        index=False
-    )
+# --------------------------------------------------
+# OUTPUT
+# --------------------------------------------------
 
-    pd.DataFrame({
-        "Shared Cost Number": mdi_only
-    }).to_excel(
-        writer,
-        sheet_name="MDI Only",
-        index=False
-    )
+OUTPUT_FILE = "MDI_TPP_Reconciliation.xlsx"
 
-    pd.DataFrame({
-        "Shared Cost Number": c55_only
-    }).to_excel(
-        writer,
-        sheet_name="C55 Only",
-        index=False
-    )
+with pd.ExcelWriter(
+    OUTPUT_FILE,
+    engine="openpyxl"
+) as writer:
 
-    pd.DataFrame({
-        "Metric": [
-            "MDI Records",
-            "C55 Records",
-            "Matching Keys",
-            "MDI Only",
-            "C55 Only",
-            "Field Differences"
-        ],
-        "Value": [
-            len(all_tpp),
-            len(c55),
-            len(matching_keys),
-            len(mdi_only),
-            len(c55_only),
-            len(changes_df)
-        ]
-    }).to_excel(
+    summary_df.to_excel(
         writer,
         sheet_name="Summary",
         index=False
     )
 
-print(f"Report written to: {output_file}")
+    mapping_df.to_excel(
+        writer,
+        sheet_name="Column Mapping Matrix",
+        index=False
+    )
+
+    changes_df.to_excel(
+        writer,
+        sheet_name="Field Differences",
+        index=False
+    )
+
+    mdi_only_df.to_excel(
+        writer,
+        sheet_name="MDI Only",
+        index=False
+    )
+
+    c55_only_df.to_excel(
+        writer,
+        sheet_name="C55 Only",
+        index=False
+    )
+
+print(f"Created: {OUTPUT_FILE}")
