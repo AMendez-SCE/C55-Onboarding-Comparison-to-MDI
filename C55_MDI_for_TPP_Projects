@@ -3,9 +3,9 @@ import numpy as np
 import re
 from difflib import SequenceMatcher
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 INPUT_FILE = "MDI TPP List Analysis.xlsx"
 
@@ -15,21 +15,31 @@ C55_SHEET = "Matching C55 Projects"
 MDI_KEY = "Shared Cost Number"
 C55_KEY = "MDI Legacy Shared Cost #"
 
-FUZZY_MATCH_THRESHOLD = 0.80
+AUTO_ACCEPT_THRESHOLD = 0.90
+AMBIGUOUS_THRESHOLD = 0.75
 
-# --------------------------------------------------
+# ==================================================
+# MANUAL COLUMN OVERRIDES
+# ==================================================
+
+MANUAL_COLUMN_MAP = {
+    "Shared Cost Number": "MDI Legacy Shared Cost #",
+    # Examples:
+    # "PM Name": "Project Manager",
+    # "BPO": "Business Project Owner",
+    # "Forecast Finish": "Forecast End Date"
+}
+
+# ==================================================
 # HELPERS
-# --------------------------------------------------
+# ==================================================
 
-def normalize_column_name(col_name):
-    """
-    Normalize column names for matching.
-    """
+def normalize_column_name(value):
 
-    if pd.isna(col_name):
+    if pd.isna(value):
         return ""
 
-    value = str(col_name).strip().lower()
+    value = str(value).strip().lower()
 
     value = value.replace("&", "and")
     value = value.replace("#", "number")
@@ -39,7 +49,27 @@ def normalize_column_name(col_name):
     return value
 
 
-def similarity(a, b):
+def normalize_value(value):
+
+    if pd.isna(value):
+        return ""
+
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, float):
+
+        # Normalize 1 and 1.0
+        if value.is_integer():
+            return str(int(value))
+
+        return str(round(value, 6))
+
+    return str(value).strip()
+
+
+def fuzzy_score(a, b):
+
     return SequenceMatcher(
         None,
         normalize_column_name(a),
@@ -47,20 +77,9 @@ def similarity(a, b):
     ).ratio()
 
 
-def normalize_value(v):
-
-    if pd.isna(v):
-        return ""
-
-    if isinstance(v, pd.Timestamp):
-        return v.strftime("%Y-%m-%d")
-
-    return str(v).strip()
-
-
-# --------------------------------------------------
+# ==================================================
 # LOAD DATA
-# --------------------------------------------------
+# ==================================================
 
 mdi = pd.read_excel(
     INPUT_FILE,
@@ -77,86 +96,203 @@ c55 = pd.read_excel(
 mdi.columns = [str(c).strip() for c in mdi.columns]
 c55.columns = [str(c).strip() for c in c55.columns]
 
-# --------------------------------------------------
-# BUILD COLUMN MAPPING
-# --------------------------------------------------
+# ==================================================
+# DUPLICATE KEY CHECKS
+# ==================================================
 
-mdi_cols = list(mdi.columns)
-c55_cols = list(c55.columns)
+mdi_duplicates = (
+    mdi[mdi[MDI_KEY].duplicated(keep=False)]
+    .sort_values(MDI_KEY)
+)
+
+c55_duplicates = (
+    c55[c55[C55_KEY].duplicated(keep=False)]
+    .sort_values(C55_KEY)
+)
+
+# ==================================================
+# BUILD COLUMN MAP
+# ==================================================
 
 mapping_rows = []
 
-used_c55_columns = set()
+mapped_pairs = {}
 
-for mdi_col in mdi_cols:
+for mdi_col in mdi.columns:
 
-    best_match = None
-    best_score = 0
+    # ------------------------------------------
+    # MANUAL OVERRIDE
+    # ------------------------------------------
 
-    # Exact match
-    for c55_col in c55_cols:
+    if mdi_col in MANUAL_COLUMN_MAP:
 
-        if normalize_column_name(mdi_col) == normalize_column_name(c55_col):
-            best_match = c55_col
-            best_score = 1.0
+        c55_col = MANUAL_COLUMN_MAP[mdi_col]
+
+        mapping_rows.append({
+            "MDI Column": mdi_col,
+            "C55 Column": c55_col,
+            "Match Type": "Manual",
+            "Best Score": 1.000,
+            "Second Best": None,
+            "Second Score": None,
+            "Status": "Accepted"
+        })
+
+        mapped_pairs[mdi_col] = c55_col
+
+        continue
+
+    # ------------------------------------------
+    # EXACT NORMALIZED MATCH
+    # ------------------------------------------
+
+    exact_match = None
+
+    for candidate in c55.columns:
+
+        if (
+            normalize_column_name(mdi_col)
+            ==
+            normalize_column_name(candidate)
+        ):
+            exact_match = candidate
             break
 
-    # Fuzzy match
-    if best_match is None:
+    if exact_match:
 
-        for c55_col in c55_cols:
+        mapping_rows.append({
+            "MDI Column": mdi_col,
+            "C55 Column": exact_match,
+            "Match Type": "Exact",
+            "Best Score": 1.000,
+            "Second Best": None,
+            "Second Score": None,
+            "Status": "Accepted"
+        })
 
-            score = similarity(mdi_col, c55_col)
+        mapped_pairs[mdi_col] = exact_match
 
-            if score > best_score:
-                best_score = score
-                best_match = c55_col
+        continue
 
-    matched = best_score >= FUZZY_MATCH_THRESHOLD
+    # ------------------------------------------
+    # FUZZY MATCH
+    # ------------------------------------------
+
+    candidates = []
+
+    for c55_col in c55.columns:
+
+        score = fuzzy_score(
+            mdi_col,
+            c55_col
+        )
+
+        candidates.append(
+            (c55_col, score)
+        )
+
+    candidates.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    best_col, best_score = candidates[0]
+
+    if len(candidates) > 1:
+        second_col, second_score = candidates[1]
+    else:
+        second_col = None
+        second_score = None
+
+    status = "Rejected"
+
+    if best_score >= AUTO_ACCEPT_THRESHOLD:
+        status = "Accepted"
+
+    elif best_score >= AMBIGUOUS_THRESHOLD:
+        status = "Ambiguous"
+
+    # ------------------------------------------
+    # CLOSE SCORES = REVIEW REQUIRED
+    # ------------------------------------------
+
+    if (
+        second_score is not None
+        and best_score >= AMBIGUOUS_THRESHOLD
+        and abs(best_score - second_score) < 0.05
+    ):
+        status = "Ambiguous"
 
     mapping_rows.append({
         "MDI Column": mdi_col,
-        "C55 Column": best_match if matched else None,
-        "Similarity Score": round(best_score, 3),
-        "Mapped": matched
+        "C55 Column": best_col,
+        "Match Type": "Fuzzy",
+        "Best Score": round(best_score, 3),
+        "Second Best": second_col,
+        "Second Score": (
+            round(second_score, 3)
+            if second_score
+            else None
+        ),
+        "Status": status
     })
 
-    if matched and best_match:
-        used_c55_columns.add(best_match)
+    if status == "Accepted":
+        mapped_pairs[mdi_col] = best_col
 
 mapping_df = pd.DataFrame(mapping_rows)
 
-# --------------------------------------------------
-# PREPARE RECORD MATCHING
-# --------------------------------------------------
+# ==================================================
+# PREPARE KEYS
+# ==================================================
 
-mdi["_KEY"] = mdi[MDI_KEY].astype(str).str.strip()
-c55["_KEY"] = c55[C55_KEY].astype(str).str.strip()
+mdi["_KEY"] = (
+    mdi[MDI_KEY]
+    .astype(str)
+    .str.strip()
+)
 
-mdi_indexed = mdi.set_index("_KEY", drop=False)
-c55_indexed = c55.set_index("_KEY", drop=False)
+c55["_KEY"] = (
+    c55[C55_KEY]
+    .astype(str)
+    .str.strip()
+)
 
-mdi_keys = set(mdi_indexed.index)
-c55_keys = set(c55_indexed.index)
+mdi_index = mdi.set_index(
+    "_KEY",
+    drop=False
+)
 
-matching_keys = sorted(mdi_keys & c55_keys)
-mdi_only = sorted(mdi_keys - c55_keys)
-c55_only = sorted(c55_keys - mdi_keys)
+c55_index = c55.set_index(
+    "_KEY",
+    drop=False
+)
 
-# --------------------------------------------------
-# COMPARE DATA
-# --------------------------------------------------
+mdi_keys = set(mdi_index.index)
+c55_keys = set(c55_index.index)
 
-changes = []
+matching_keys = sorted(
+    mdi_keys & c55_keys
+)
 
-mapped_columns = mapping_df[
-    mapping_df["Mapped"] == True
-]
+mdi_only = sorted(
+    mdi_keys - c55_keys
+)
+
+c55_only = sorted(
+    c55_keys - mdi_keys
+)
+
+# ==================================================
+# FIELD COMPARISON
+# ==================================================
+
+difference_rows = []
 
 for key in matching_keys:
 
-    mdi_row = mdi_indexed.loc[key]
-    c55_row = c55_indexed.loc[key]
+    mdi_row = mdi_index.loc[key]
+    c55_row = c55_index.loc[key]
 
     if isinstance(mdi_row, pd.DataFrame):
         mdi_row = mdi_row.iloc[0]
@@ -164,39 +300,55 @@ for key in matching_keys:
     if isinstance(c55_row, pd.DataFrame):
         c55_row = c55_row.iloc[0]
 
-    for _, map_row in mapped_columns.iterrows():
-
-        mdi_col = map_row["MDI Column"]
-        c55_col = map_row["C55 Column"]
+    for mdi_col, c55_col in mapped_pairs.items():
 
         mdi_value = mdi_row.get(mdi_col)
         c55_value = c55_row.get(c55_col)
 
-        if normalize_value(mdi_value) != normalize_value(c55_value):
+        mdi_value_norm = normalize_value(mdi_value)
+        c55_value_norm = normalize_value(c55_value)
 
-            changes.append({
+        if mdi_value_norm != c55_value_norm:
+
+            difference_rows.append({
                 "Shared Cost Number": key,
                 "MDI Column": mdi_col,
                 "C55 Column": c55_col,
                 "MDI Value": mdi_value,
                 "C55 Value": c55_value,
-                "Similarity Score": map_row["Similarity Score"]
+                "Difference Type": "Value Changed"
             })
 
-changes_df = pd.DataFrame(changes)
+differences_df = pd.DataFrame(
+    difference_rows
+)
 
-# --------------------------------------------------
+# ==================================================
+# REVIEW REQUIRED
+# ==================================================
+
+review_df = mapping_df[
+    mapping_df["Status"] == "Ambiguous"
+].copy()
+
+rejected_df = mapping_df[
+    mapping_df["Status"] == "Rejected"
+].copy()
+
+# ==================================================
 # SUMMARY
-# --------------------------------------------------
+# ==================================================
 
 summary_df = pd.DataFrame({
     "Metric": [
         "MDI Records",
         "C55 Records",
-        "Matching Records",
-        "MDI Only Records",
-        "C55 Only Records",
-        "Mapped Columns",
+        "Matching Shared Cost Numbers",
+        "MDI Only",
+        "C55 Only",
+        "Accepted Column Maps",
+        "Ambiguous Column Maps",
+        "Rejected Column Maps",
         "Field Differences"
     ],
     "Value": [
@@ -205,22 +357,16 @@ summary_df = pd.DataFrame({
         len(matching_keys),
         len(mdi_only),
         len(c55_only),
-        len(mapped_columns),
-        len(changes_df)
+        len(mapping_df[mapping_df["Status"]=="Accepted"]),
+        len(review_df),
+        len(rejected_df),
+        len(differences_df)
     ]
 })
 
-mdi_only_df = pd.DataFrame({
-    "Shared Cost Number": mdi_only
-})
-
-c55_only_df = pd.DataFrame({
-    "Shared Cost Number": c55_only
-})
-
-# --------------------------------------------------
+# ==================================================
 # OUTPUT
-# --------------------------------------------------
+# ==================================================
 
 OUTPUT_FILE = "MDI_TPP_Reconciliation.xlsx"
 
@@ -241,22 +387,50 @@ with pd.ExcelWriter(
         index=False
     )
 
-    changes_df.to_excel(
+    review_df.to_excel(
+        writer,
+        sheet_name="Review Required",
+        index=False
+    )
+
+    rejected_df.to_excel(
+        writer,
+        sheet_name="Rejected Matches",
+        index=False
+    )
+
+    differences_df.to_excel(
         writer,
         sheet_name="Field Differences",
         index=False
     )
 
-    mdi_only_df.to_excel(
+    pd.DataFrame({
+        "Shared Cost Number": mdi_only
+    }).to_excel(
         writer,
         sheet_name="MDI Only",
         index=False
     )
 
-    c55_only_df.to_excel(
+    pd.DataFrame({
+        "Shared Cost Number": c55_only
+    }).to_excel(
         writer,
         sheet_name="C55 Only",
         index=False
     )
 
-print(f"Created: {OUTPUT_FILE}")
+    mdi_duplicates.to_excel(
+        writer,
+        sheet_name="MDI Duplicates",
+        index=False
+    )
+
+    c55_duplicates.to_excel(
+        writer,
+        sheet_name="C55 Duplicates",
+        index=False
+    )
+
+print(f"Created {OUTPUT_FILE}")
