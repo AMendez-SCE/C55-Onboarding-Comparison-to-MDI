@@ -9,11 +9,11 @@ from difflib import SequenceMatcher
 
 INPUT_FILE = "MDI TPP List Analysis.xlsx"
 
-MDI_SHEET = "All TPP"
-C55_SHEET = "Matching C55 Projects"
+MDI_SHEET = "MDI Migrated Projects"
+C55_SHEET = "C55 TPPs"
 
 MDI_KEY = "Shared Cost Number"
-C55_KEY = "MDI Legacy Shared Cost #"
+C55_KEY = "Legacy SCN"
 
 AUTO_ACCEPT_THRESHOLD = 0.90
 AMBIGUOUS_THRESHOLD = 0.75
